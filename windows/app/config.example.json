@@ -12,5 +12,9 @@
   }
  ],
  "vm_url": "http://victoriametrics.local:8428",
- "job_token": "GENERATE_EG_python_-c_'import_secrets;print(secrets.token_urlsafe(24))'"
+ "job_token": "GENERATE_EG_python_-c_'import_secrets;print(secrets.token_urlsafe(24))'",
+ "weather": {
+  "lat": 51.3172,
+  "lon": 4.5878
+ }
 }

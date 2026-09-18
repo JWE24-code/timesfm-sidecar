@@ -1,5 +1,4 @@
 import json
-import os
 import logging
 import threading
 import time
@@ -18,9 +17,8 @@ from auth import require
 
 log = logging.getLogger("tmfm")
 
-HOME = Path(os.environ.get("TIMESFM_HOME", r"C:\timesfm"))
-APP_DIR = HOME / "app"
-DATA_DIR = HOME / "data"
+APP_DIR = Path(r"C:\timesfm\app")
+DATA_DIR = Path(r"C:\timesfm\data")
 DB_FILE = DATA_DIR / "energy.duckdb"
 WATCHER_STATE = Path(r"C:\timesfm\watcher_state.json")
 CONFIG = json.loads((APP_DIR / "config.json").read_text(encoding="utf-8"))
@@ -177,7 +175,51 @@ class ForecastReq(BaseModel):
     context_days: int = Field(default=7, ge=2, le=30)
 
 
-METRIC_BASE = {"watt": "home_power_watts", "kwh": "home_energy_kwh"}
+METRIC_BASE = {"watt": "home_power_watts", "kwh": "home_energy_kwh", "temp_c": "home_temp_c"}
+
+
+def _fetch_weather() -> list:
+    w = CONFIG.get("weather") or {}
+    if not w.get("lat") or not w.get("lon"):
+        return []
+    url = (
+        "https://api.open-meteo.com/v1/forecast"
+        f"?latitude={w['lat']}&longitude={w['lon']}"
+        "&hourly=temperature_2m&past_days=8&forecast_days=8&timezone=UTC"
+    )
+    r = httpx.get(url, timeout=30)
+    r.raise_for_status()
+    h = r.json()["hourly"]
+    out = []
+    for t, v in zip(h["time"], h["temperature_2m"]):
+        if v is None:
+            continue
+        ts = datetime.strptime(t, "%Y-%m-%dT%H:%M").replace(tzinfo=timezone.utc).replace(tzinfo=None)
+        out.append((ts, float(v)))
+    log.info("weather: %d hourly points (%s .. %s)", len(out), out[0][0], out[-1][0])
+    return out
+
+
+def _interp_15min(points: list, start: datetime, count: int) -> list:
+    grid = [start + timedelta(minutes=BUCKET_MINUTES * i) for i in range(count)]
+    out = []
+    j = 0
+    for g in grid:
+        while j + 1 < len(points) and points[j + 1][0] <= g:
+            j += 1
+        if g < points[0][0] or (j + 1 >= len(points) and g > points[-1][0]):
+            out.append(None)
+            continue
+        if points[j][0] == g:
+            out.append(points[j][1])
+            continue
+        if j + 1 >= len(points):
+            out.append(None)
+            continue
+        (ta, va), (tb, vb) = points[j], points[j + 1]
+        frac = (g - ta).total_seconds() / (tb - ta).total_seconds()
+        out.append(va + (vb - va) * frac)
+    return out
 
 
 def _vm_push(lines: list) -> None:
@@ -253,6 +295,21 @@ def _do_ingest(days: int) -> dict:
                 if rows:
                     con.executemany("INSERT OR REPLACE INTO hourly VALUES (?, ?, ?, ?)", rows)
                 ingested[f"{metric}:{entity}"] = len(rows)
+        try:
+            wx = _fetch_weather()
+            if wx:
+                n = int((wx[-1][0] - wx[0][0]).total_seconds() // (BUCKET_MINUTES * 60)) + 1
+                grid = _interp_15min(wx, wx[0][0], n)
+                wrows = [
+                    ("weather", "temp_c", wx[0][0] + timedelta(minutes=BUCKET_MINUTES * i), v)
+                    for i, v in enumerate(grid)
+                    if v is not None
+                ]
+                if wrows:
+                    con.executemany("INSERT OR REPLACE INTO hourly VALUES (?, ?, ?, ?)", wrows)
+                ingested["temp_c:weather"] = len(wrows)
+        except Exception as e:
+            log.warning("weather ingest failed (non-fatal): %s", e)
         con.execute("COMMIT")
     except Exception:
         con.execute("ROLLBACK")
@@ -330,8 +387,29 @@ def _do_forecast(entity: str, metric: str, horizon: int, context_days: int) -> d
     if len(values) < 48:
         raise HTTPException(status_code=400, detail=f"not enough history: {len(values)} points, need >= 48")
     last_ts = rows[-1][0]
+    cov = None
+    try:
+        wx = _fetch_weather()
+        if wx:
+            n_total = len(values) + horizon
+            cov = _interp_15min(wx, rows[0][0], n_total)
+            missing = sum(1 for v in cov if v is None)
+            if missing > n_total * 0.05:
+                log.warning("weather coverage sparse (%d/%d missing), skipping covariates", missing, n_total)
+                cov = None
+            else:
+                cov = [v if v is not None else float("nan") for v in cov]
+                log.info("weather covariates: %d points aligned from %s", len(cov), rows[0][0])
+    except Exception as e:
+        log.warning("weather covariates unavailable: %s", e)
+        cov = None
     t0 = time.time()
-    result = model.predict(context=np.asarray(values, dtype=np.float32), horizon=horizon, return_quantiles=True)
+    result = model.predict(
+        context=np.asarray(values, dtype=np.float32),
+        horizon=horizon,
+        past_future_covariates=np.asarray([cov], dtype=np.float32) if cov is not None else None,
+        return_quantiles=True,
+    )
     elapsed = round(time.time() - t0, 2)
     fc = np.atleast_2d(np.asarray(result.forecast, dtype=float))
     forecast_values = _finite(fc[0].tolist() if fc.shape[0] == 1 else fc.tolist())

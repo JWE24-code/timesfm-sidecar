@@ -33,7 +33,24 @@ HTTP with API keys, so sensitive source data never has to live on the node
 | `windows/app/viz.html` | minimal same-origin chart page (optional; Grafana is the primary UI) |
 | `windows/app/config.example.json` | node configuration template |
 | `clients/portfolio_forecast.py` | laptop-side client: reconstruct portfolio value from public prices, ephemeral forecast, push to VM |
+| `clients/csv_forecast.py` | stdlib-only client: forecast any CSV column (or `--demo` synthetic series) via `/forecast/adhoc` |
 | `grafana/*.json` | importable dashboards (datasource picker on import) |
+| `docs/screenshots/` | dashboard screenshots |
+
+## Quickstart
+
+Already have a node running? Forecast any CSV column with zero client
+dependencies:
+
+```bash
+python3 clients/csv_forecast.py --demo value --horizon 48 \
+    --api-host http://<node-ip>:8000 --api-key tmfm_...
+# → prints inference time + forecast head/tail, writes demo_forecast.csv
+# add --vm-url http://<victoriametrics>:8428 --metric my_series to graph it
+```
+
+Everything goes through `/forecast/adhoc`: computed in RAM, nothing stored on
+the node.
 
 ## Windows node setup
 
@@ -54,6 +71,12 @@ HTTP with API keys, so sensitive source data never has to live on the node
    On pre-RDNA2 AMD GPUs use `device="cpu"` (no ROCm on Windows).
 3. Copy `windows/` + `windows/app/` to the node, create `app/config.json` from
    the example, lock its ACL: `icacls config.json /inheritance:r /grant SYSTEM:F /grant Administrators:F`
+   The optional `weather` block (`lat`/`lon`) enables temperature covariates:
+   hourly outdoor temperature from the free open-meteo API (no key) is aligned
+   to the 15-min bucket grid and passed to TimesFM as a `past_future_covariates`
+   array; it is also stored/pushed as `home_temp_c{source="open-meteo"}` so you
+   can overlay it in Grafana. Any weather failure degrades gracefully to a
+   plain forecast.
 4. Self-test the suspend/resume mechanics:
    `powershell -File watcher.ps1 -SelfTest`
 5. Register everything (from an **admin** session; schtasks System-principal
@@ -106,6 +129,7 @@ import time. Metrics produced:
 |---|---|
 | `home_power_watts{entity,kind}` / `home_energy_kwh{entity,kind}` | energy actual / forecast / band_low / band_high |
 | `home_power_watts_mae24` | 24h-horizon mean absolute error (accuracy) |
+| `home_temp_c{source}` | outdoor temperature (open-meteo) used as forecast covariate |
 | `portfolio_value_eur{kind}` | portfolio value actual / forecast / band |
 | `portfolio_value_eur_forecast_last`, `_mae7` | 30d-ahead point forecast, 7d-horizon MAE |
 | `stock_forecast_return_pct{symbol}`, `stock_forecast_signal{symbol}` | per-position expected return and ±threshold signal |
@@ -148,3 +172,17 @@ import time. Metrics produced:
 7. **Gaming detection**: max `engtype_3D` GPU-engine utilization, 6×10s above
    threshold = gaming; 12×10s below = idle again. Video playback won't trigger
    it (VideoDecode engines are ignored).
+8. **TimesFM covariates**: `past_only_covariates` must be `(C, len(context))`,
+   `past_future_covariates` must be `(C, len(context) + horizon)` — the future
+   half is what the model actually conditions on. Both are `atleast_2d`-ed and
+   NaN-linearly-interpolated internally. Weather covariates need hourly source
+   data spanning the whole context *and* horizon (open-meteo `past_days=8,
+   forecast_days=8` covers both).
+9. **`schtasks /End` often fails to kill detached processes** — the API task
+   can look "stopped" while an old python still binds :8000, and the next
+   start dies with `WinError 10048`. Find the stale listener by PID:
+   `netstat -ano | findstr :8000 | findstr LISTENING` then `taskkill /F /PID <pid>`.
+
+## Screenshots
+
+![Energy dashboard](docs/screenshots/energy.png)

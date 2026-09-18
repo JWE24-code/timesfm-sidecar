@@ -1,0 +1,11 @@
+timesfm[torch]>=3.0
+pandas
+einops
+utilsforecast
+fastapi
+uvicorn
+duckdb
+httpx
+
+# Windows + AMD (pre-RDNA2) / no-CUDA machines: force CPU torch wheels:
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
