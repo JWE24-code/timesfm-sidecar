@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="nl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Energie — MyDesktop</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+<style>
+  :root { color-scheme: dark; }
+  body { font-family: system-ui, sans-serif; background: #11131a; color: #d8dae2; margin: 0; padding: 24px; }
+  h1 { font-size: 18px; font-weight: 600; margin: 0 0 4px; }
+  #meta { font-size: 12px; color: #8a8fa3; margin-bottom: 16px; }
+  .bar { display: flex; gap: 12px; align-items: center; margin-bottom: 14px; flex-wrap: wrap; }
+  select, button { background: #1c1f2b; color: #d8dae2; border: 1px solid #2e3345; border-radius: 6px; padding: 6px 10px; font-size: 13px; }
+  button { cursor: pointer; }
+  button:hover { background: #262a3a; }
+  .card { background: #161923; border: 1px solid #232839; border-radius: 10px; padding: 18px; }
+  #chart { max-height: 460px; }
+  #overlay { position: fixed; inset: 0; background: rgba(8,9,14,.9); display: flex; align-items: center; justify-content: center; }
+  #overlay.hidden { display: none; }
+  .prompt { background: #161923; border: 1px solid #2e3345; border-radius: 10px; padding: 28px; width: 320px; }
+  .prompt h2 { font-size: 15px; margin: 0 0 12px; }
+  .prompt input { width: 100%; box-sizing: border-box; background: #1c1f2b; color: #d8dae2; border: 1px solid #2e3345; border-radius: 6px; padding: 8px; font-size: 13px; }
+  .prompt p { font-size: 12px; color: #8a8fa3; }
+  #err { color: #ff6b6b; font-size: 12px; margin-top: 10px; min-height: 15px; }
+</style>
+</head>
+<body>
+<h1>Energie — MyDesktop</h1>
+<div id="meta">loading…</div>
+<div class="bar">
+  <select id="entity"></select>
+  <select id="days">
+    <option value="1">1 dag historie</option>
+    <option value="3" selected>3 dagen historie</option>
+    <option value="7">7 dagen historie</option>
+  </select>
+  <button id="reload">Verversen</button>
+</div>
+<div class="card"><canvas id="chart"></canvas></div>
+<div id="overlay">
+  <div class="prompt">
+    <h2>API key</h2>
+    <input id="key" type="password" placeholder="tmfm_…" autofocus>
+    <p>Wordt alleen in je browser (localStorage) bewaard.</p>
+    <div id="err"></div>
+    <button id="save">Opslaan</button>
+  </div>
+</div>
+<script>
+const HOST = location.origin;
+const ENTITY = "sensor.electriciteitskast_power";
+let chart = null;
+
+const $ = (id) => document.getElementById(id);
+
+function getKey() { return localStorage.getItem("tmfm_key") || ""; }
+
+async function api(path, opts = {}) {
+  const res = await fetch(HOST + path, {
+    ...opts,
+    headers: { "Content-Type": "application/json", "X-API-Key": getKey(), ...(opts.headers || {}) }
+  });
+  if (res.status === 401 || res.status === 403) {
+    localStorage.removeItem("tmfm_key");
+    $("overlay").classList.remove("hidden");
+    throw new Error("ongeldige API key");
+  }
+  if (!res.ok) throw new Error(`${res.status} ${await res.text()}`);
+  return res.json();
+}
+
+function fmtLabel(iso, withTime) {
+  const d = new Date(iso + "Z");
+  const day = d.toLocaleDateString("nl-BE", { day: "2-digit", month: "2-digit" });
+  const time = d.toLocaleTimeString("nl-BE", { hour: "2-digit", minute: "2-digit" });
+  return withTime ? `${day} ${time}` : time;
+}
+
+async function load() {
+  $("meta").textContent = "laden…";
+  const days = $("days").value;
+  const entity = $("entity").value || ENTITY;
+  try {
+    const [series, fc] = await Promise.all([
+      api(`/series?entity=${encodeURIComponent(entity)}&metric=watt&days=${days}`),
+      api("/forecast", {
+        method: "POST",
+        body: JSON.stringify({ entity, metric: "watt", horizon: 96, context_days: 7 })
+      })
+    ]);
+    draw(series, fc, entity);
+  } catch (e) {
+    $("meta").textContent = "fout: " + e.message;
+  }
+}
+
+function draw(series, fc, entity) {
+  const pts = series.points.map(p => ({ x: p.ts, y: p.value }));
+  const start = pts.length ? pts[pts.length - 1].x : fc.created;
+  const fLabels = fc.forecast.map((_, i) => {
+    const t = new Date(start + "Z").getTime() + (i + 1) * 15 * 60000;
+    return new Date(t).toISOString().replace(".000Z", "");
+  });
+  const labels = [...pts.map(p => p.x), ...fLabels];
+  const actual = [...pts.map(p => p.y), ...Array(fc.forecast.length).fill(null)];
+  const forecastLine = [...Array(pts.length).fill(null), ...fc.forecast];
+  const q = fc.quantiles;
+  let qLow = null, qHigh = null;
+  if (Array.isArray(q) && q.length) {
+    qLow = [...Array(pts.length).fill(null), ...q.map(r => r[0])];
+    qHigh = [...Array(pts.length).fill(null), ...q.map(r => r[r.length - 1])];
+  }
+  const datasets = [
+    { label: "werkelijk", data: actual, borderColor: "#e8eaf2", borderWidth: 1.5, pointRadius: 0, tension: 0.2 },
+    { label: "prognose", data: forecastLine, borderColor: "#ffa94d", borderWidth: 1.8, pointRadius: 0, borderDash: [6, 3], tension: 0.2 }
+  ];
+  if (qLow) {
+    datasets.push({ label: "q-laag", data: qLow, borderColor: "transparent", pointRadius: 0, tension: 0.2 });
+    datasets.push({ label: "band 80%", data: qHigh, borderColor: "transparent", backgroundColor: "rgba(255,169,77,.12)", fill: "-1", pointRadius: 0, tension: 0.2 });
+  }
+  if (chart) chart.destroy();
+  chart = new Chart($("chart"), {
+    type: "line",
+    data: { labels, datasets },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      interaction: { mode: "index", intersect: false },
+      plugins: {
+        legend: { labels: { color: "#aeb3c5", filter: (i) => !["q-laag"].includes(i.text) } },
+        tooltip: { callbacks: { label: (c) => `${c.dataset.label}: ${Math.round(c.parsed.y)} W` } }
+      },
+      scales: {
+        x: {
+          ticks: { color: "#7d8296", maxTicksLimit: 12, callback: function (v) { return fmtLabel(labels[v], true); } },
+          grid: { color: "#1e2231" }
+        },
+        y: {
+          ticks: { color: "#7d8296", callback: (v) => `${v} W` },
+          grid: { color: "#1e2231" }
+        }
+      }
+    }
+  });
+  const last = pts.length ? pts[pts.length - 1].y : null;
+  $("meta").textContent =
+    `${entity} · ${pts.length} metingen + ${fc.forecast.length} voorspeld (24u) · prognose berekend in ${fc.elapsed_s}s · laatste meting ${last != null ? Math.round(last) + " W" : "-"}`;
+}
+
+async function init() {
+  try {
+    const ents = await api("/entities");
+    const sel = $("entity");
+    sel.innerHTML = "";
+    ents.series.filter(s => s.metric === "watt").forEach(s => {
+      const o = document.createElement("option");
+      o.value = s.entity;
+      o.textContent = s.entity.replace("sensor.", "").replaceAll("_", " ");
+      sel.appendChild(o);
+    });
+    if (![...sel.options].some(o => o.value === ENTITY) && sel.options.length) {
+    } else {
+      sel.value = ENTITY;
+    }
+  } catch (e) {}
+  load();
+}
+
+$("save").onclick = () => {
+  localStorage.setItem("tmfm_key", $("key").value.trim());
+  $("overlay").classList.add("hidden");
+  init();
+};
+$("key").addEventListener("keydown", (e) => { if (e.key === "Enter") $("save").click(); });
+$("reload").onclick = load;
+$("days").onchange = load;
+$("entity").onchange = load;
+
+if (getKey()) {
+  $("overlay").classList.add("hidden");
+  init();
+}
+</script>
+</body>
+</html>

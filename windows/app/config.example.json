@@ -1,0 +1,16 @@
+{
+ "ha_url": "http://home-assistant.local:8123",
+ "ha_token": "PASTE_HA_LONG_LIVED_TOKEN",
+ "entities": [
+  {
+   "energy": "sensor.house_meter_energy",
+   "power": "sensor.house_meter_power"
+  },
+  {
+   "energy": "sensor.smartplug_example_energy",
+   "power": ""
+  }
+ ],
+ "vm_url": "http://victoriametrics.local:8428",
+ "job_token": "GENERATE_EG_python_-c_'import_secrets;print(secrets.token_urlsafe(24))'"
+}
